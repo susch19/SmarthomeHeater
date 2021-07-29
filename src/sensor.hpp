@@ -1,6 +1,7 @@
 #include <OneWire.h>
 #include <DS18B20.h>
 #define _TASK_STD_FUNCTION
+#define _TASK_PRIORITY
 #include <TaskSchedulerDeclarations.h>
 #include <queue>
 

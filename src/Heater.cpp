@@ -5,23 +5,32 @@
 
 // TempSensor tempSensor();
 TempSensor::tempMeasuremntCallback_t call;
-#define DATA_OFFSET 4
 
-std::vector<Heater::TimeTempMessage> Heater::stringToTTM(const String &str)
+std::vector<Heater::TimeTempMessage> Heater::stringToTTM(const std::string &s)
 {
     size_t size;
-    std::string s = painlessmesh::base64::decodeStd(str, size);
     char *buf = const_cast<char *>(s.data());
+
+    Serial.print("got ttm: ");
+    for (auto c : s)
+    {
+        Serial.printf("%X", c);
+    }
+    Serial.println();
 
     TimeTempMessage *ttm = reinterpret_cast<TimeTempMessage *>(buf);
     std::vector<TimeTempMessage> ttms;
     for (size_t i = 0; i < s.size() / sizeof(TimeTempMessage); i++)
+    {
+        auto mtt = ttm[i];
+        Serial.printf("Time:%d, Temp:%d, Dow:%d\n", mtt.Time, mtt.Temp, mtt.DayOfWeek);
         ttms.emplace_back(ttm[i]);
+    }
 
     return ttms;
 }
 
-void Heater::decodeSmartHomeTimeTempMessage(const String &msg)
+void Heater::decodeSmartHomeTimeTempMessage(const std::string &msg)
 {
     auto ttms = stringToTTM(msg);
     config.clear();
@@ -32,42 +41,40 @@ void Heater::decodeSmartHomeTimeTempMessage(const String &msg)
     uint8_t count = ttms.size();
     if (count > 0)
     {
-        EEPROMr.write(DATA_OFFSET, count);
-        uint16_t address = DATA_OFFSET;
+        TimeTempMessageConfig ttmConfig;
+        ttmConfig.length = count;
+        uint8_t count = ttms.size();
 
-        for (auto ttm : ttms)
-        {
-            auto buf = reinterpret_cast<uint8 *>(&ttm);
-            EEPROMr.write(++address, buf[0]);
-            EEPROMr.write(++address, buf[1]);
-            EEPROMr.write(++address, buf[2]);
-        }
+        for (size_t i = 0; i < count; i++)
+            ttmConfig.configs[i] = config[i];
 
-        EEPROMr.commit();
+        fileSystem.writeStruct("/config", ttmConfig);
     }
 }
 
-void Heater::OnMsgReceived(uint32_t from, const String &messageType, const String &command, const String &parameter)
+void Heater::OnMeshMsgReceived(uint32_t from, const std::string &messageType, const std::string &command, const std::vector<MessageParameter> &parameters)
 {
     if (messageType == "Get")
     {
         if (command == "Temp")
         {
-            tempSensor.requestTemperature([from, this](float temp) { this->sendSingle(from, "Update", "Temp", {temp}); });
+            tempSensor.requestTemperature([from, this](float temp)
+                                          { this->sendSingle(from, "Update", "Temp", {temp}); });
         }
     }
     else if (messageType == "Update")
     {
         if (command == "Temp")
         {
-            userConf = stringToTTM(parameter.substring(2, parameter.length() - 2)).back();
+            userConf = stringToTTM(parameters.front().get()).back();
             tempSensor.requestTemperature(bind(&Heater::tempMeasureCallback, this, std::placeholders::_1));
         }
         else if (command == "WhoIAm")
         {
             digitalWrite(LED_BUILTIN, LOW);
             ledWhoIAmTask = Device::make_unique<Task>(TASK_SECOND, TASK_ONCE,
-                                                      []() {
+                                                      []()
+                                                      {
                                                           digitalWrite(LED_BUILTIN, HIGH);
                                                       });
             userScheduler.addTask(*ledWhoIAmTask);
@@ -82,21 +89,33 @@ void Heater::OnMsgReceived(uint32_t from, const String &messageType, const Strin
     {
         if (command == "Temp")
         {
-            decodeSmartHomeTimeTempMessage(parameter.substring(2, parameter.length() - 2));
+            decodeSmartHomeTimeTempMessage(parameters.front().get());
         }
         else if (command == "Mode")
         {
             debug = !debug;
-            digitalWrite(LED_BUILTIN, HIGH);
+            disableLED = !disableLED;
+            digitalWrite(LED_BUILTIN, disableLED);
+            fileSystem.writeStruct("/disableLed", disableLED);
         }
     }
     else if (messageType == "Relay")
     {
         if (command == "Temp")
         {
-            lastReceivedTemp = stringToTTM(parameter.substring(2, parameter.length() - 2)).back();
-            shouldCalibrate = true;
-            lastReceivedValid = true;
+            auto subStr = parameters.front().get();
+            Serial.print("Recieved Temp Callback: ");
+            for (auto c : subStr)
+            {
+                Serial.printf("%X", c);
+            }
+            Serial.println();
+            lastReceivedTemp = stringToTTM(subStr).back();
+            if (lastReceivedTemp.Temp > 0)
+            {
+                shouldCalibrate = true;
+                lastReceivedValid = true;
+            }
         }
     }
 }
@@ -106,8 +125,10 @@ std::vector<MessageParameter> Heater::AdditionalWhoAmIResponseParams()
     std::vector<MessageParameter> ret;
     if (config.size() > 0)
     {
-        auto chars = reinterpret_cast<uint8_t *>(&config[0]);
-        ret = {painlessmesh::base64::encode(chars, config.size() * sizeof(TimeTempMessage)).c_str()};
+        auto chars = reinterpret_cast<char *>(&config[0]);
+        std::string std;
+        std.append(chars, config.size() * sizeof(TimeTempMessage));
+        ret = {std};
     }
 
     return ret;
@@ -115,10 +136,9 @@ std::vector<MessageParameter> Heater::AdditionalWhoAmIResponseParams()
 
 void Heater::insert(std::vector<TimeTempMessage> &cont, TimeTempMessage value)
 {
-    std::vector<TimeTempMessage>::iterator it = std::lower_bound(cont.begin(), cont.end(), value, [](TimeTempMessage b, TimeTempMessage a) {
-        return (a.DayOfWeek == b.DayOfWeek && a.Time > b.Time) || a.DayOfWeek > b.DayOfWeek;
-    });                     // find proper position in descending order
-    cont.insert(it, value); // insert before iterator it
+    std::vector<TimeTempMessage>::iterator it = std::lower_bound(cont.begin(), cont.end(), value, [](TimeTempMessage b, TimeTempMessage a)
+                                                                 { return (a.DayOfWeek == b.DayOfWeek && a.Time > b.Time) || a.DayOfWeek > b.DayOfWeek; }); // find proper position in descending order
+    cont.insert(it, value);                                                                                                                                 // insert before iterator it
 }
 
 void Heater::tempMeasureCallback(float temp)
@@ -145,7 +165,9 @@ void Heater::tempMeasureCallback(float temp)
     bool newCalibration = false;
     if (shouldCalibrate)
     {
+
         calibration = TimeTempMessage{curTTM.DayOfWeek, curTTM.Time, (uint16_t)(512 + (curTTM.Temp - lastReceivedTemp.Temp))};
+        saveCalibration(calibration); //["{\"Date\":\"08.01.2021 19:08:41\"}"], [{"Date":"08.01.2021 19:09:19"}]
         sendUpdate = true;
         shouldCalibrate = false;
         newCalibration = true;
@@ -164,9 +186,8 @@ void Heater::tempMeasureCallback(float temp)
     auto configCopy = config;
     if (userConf.Temp > 0.f)
         insert(configCopy, userConf);
-    auto res = std::find_if(configCopy.rbegin(), configCopy.rend(), [tm](TimeTempMessage ttm) {
-        return (tm.tm_wday == (int)ttm.DayOfWeek && tm.tm_hour * 60 + tm.tm_min >= ttm.Time) || tm.tm_wday > (int)ttm.DayOfWeek;
-    });
+    auto res = std::find_if(configCopy.rbegin(), configCopy.rend(), [tm](TimeTempMessage ttm)
+                            { return (tm.tm_wday == (int)ttm.DayOfWeek && tm.tm_hour * 60 + tm.tm_min >= ttm.Time) || tm.tm_wday > (int)ttm.DayOfWeek; });
     auto ttm = (res == configCopy.rend()) ? configCopy.back() : *res;
 
     if (ttm != userConf)
@@ -180,7 +201,7 @@ void Heater::tempMeasureCallback(float temp)
         // std::vector<MessageParameter> ret = {painlessmesh::base64::encode(chars, sizeof(TimeTempMessage)).c_str()};
         // sendSingle(serv, "Options", "Temp", ret);
     }
-    else if(debug && !mesh.isConnected(1))
+    else if (debug && !mesh.isConnected(1))
     {
         Serial.println("Not connected to root");
     }
@@ -193,8 +214,9 @@ void Heater::tempMeasureCallback(float temp)
             ttm.Temp = 0.f;
 
         std::array<TimeTempMessage, 3> ttms = {sendTTM, ttm, calibration};
-        auto chars = reinterpret_cast<uint8_t *>(&ttms);
-        std::vector<MessageParameter> ret = {painlessmesh::base64::encode(chars, sizeof(sendTTM) * ttms.size()).c_str()};
+        auto chars = reinterpret_cast<const char *>(&ttms);
+        auto param = std::string(chars, sizeof(TimeTempMessage) * ttms.size());
+        std::vector<MessageParameter> ret = {param};
         sendSingle(serv, "Update", "Temp", ret);
     }
 
@@ -207,8 +229,9 @@ void Heater::tempMeasureCallback(float temp)
         if (debug)
         {
             Serial.println("An");
-            digitalWrite(LED_BUILTIN, LOW);
         }
+        if (!disableLED)
+            digitalWrite(LED_BUILTIN, LOW);
     }
     else
     {
@@ -216,14 +239,18 @@ void Heater::tempMeasureCallback(float temp)
         if (debug)
         {
             Serial.println("Aus");
-            digitalWrite(LED_BUILTIN, HIGH);
         }
+        if (!disableLED)
+            digitalWrite(LED_BUILTIN, HIGH);
     }
     if (debug)
+    {
         Serial.printf("found ttm: te:%d ti:%d d:%d, userttm: ti:%d d:%d, curtmp: %d, currtime:%d\n", ttm.Temp, ttm.Time, ttm.DayOfWeek, userConf.Time, userConf.DayOfWeek, currentTemp, tm.tm_hour * 60 + tm.tm_min);
+        // Serial.print(WiFi.localIP)
+    }
 }
 
-void Heater::init()
+void Heater::preMeshSetup()
 {
     pinMode(TempSensor::sensorPin, INPUT);
     pinMode(HEATERPIN, OUTPUT);
@@ -233,46 +260,69 @@ void Heater::init()
     digitalWrite(HEATERPIN, HIGH);
     digitalWrite(HEATERPING, LOW);
     digitalWrite(SENSORPING, LOW);
-    EEPROMr.size(10);
-    EEPROMr.begin(4096);
-    uint8_t data;
+    fileSystem.init();
 
-    data = EEPROMr.read(DATA_OFFSET);
-    uint16_t address = DATA_OFFSET;
-    if (data > 0)
+    fileSystem.readStruct("/disableLed", disableLED);
+    digitalWrite(LED_BUILTIN, disableLED);
+
+    timeval tv = {.tv_sec = 0, .tv_usec = 0};
+    fileSystem.readStruct("/time", tv);
+    settimeofday(&tv, NULL);
+    Serial.println(tv.tv_sec);
+    TimeTempMessageConfig ttmConfig;
+    ttmConfig.length = 0;
+    fileSystem.readStruct("/config", ttmConfig);
+
+    if (ttmConfig.length > 0)
     {
-        std::string ttms;
-        for (size_t i = 0; i < data * sizeof(TimeTempMessage); i++)
-            ttms += EEPROMr.read(++address);
 
-        char *buf = const_cast<char *>(ttms.data());
-        TimeTempMessage *ttm = reinterpret_cast<TimeTempMessage *>(buf);
-
-        for (size_t i = 0; i < ttms.size() / sizeof(TimeTempMessage); i++)
-            config.emplace_back(ttm[i]);
+        for (size_t i = 0; i < ttmConfig.length; i++)
+            config.emplace_back(ttmConfig.configs[i]);
     }
+    fileSystem.readStruct("/calibration", calibration);
+
+    Serial.println();
+    Serial.print(calibration.Temp - 512);
+    Serial.println("°C");
 
     tempSensor.setup(&userScheduler);
 
     getTemperaturTask = Device::make_unique<Task>(TASK_SECOND * 30, TASK_FOREVER,
-                                                  [this]() {
+                                                  [this]()
+                                                  {
                                                       Serial.println("Requesting temp");
                                                       tempSensor.requestTemperature(bind(&Heater::tempMeasureCallback, this, std::placeholders::_1));
                                                   });
-    mesh.onPackage(12, [this](painlessmesh::protocol::Variant variant) {
-        EEPROMr.backup();
-        return true;
-    });
     debug = true;
     userScheduler.addTask(*getTemperaturTask);
-    // getTemperaturTask->enableDelayed(TASK_SECOND * 10);
     getTemperaturTask->enable();
 }
 
-//     EEPROM.begin(4095);
-//   for (int i = cfgStart ; i < sizeof(cfg) ; i++) {
-//     EEPROM.write(i, 0);
-//   }
-//   delay(200);
-//   EEPROM.commit();
-//   EEPROM.end();
+void Heater::saveCalibration(TimeTempMessage calibration)
+{
+
+    TimeTempMessage val;
+    fileSystem.readStruct("/calibration", val);
+    if ((calibration.Temp > val.Temp && calibration.Temp - val.Temp > 2) || (calibration.Temp < val.Temp && val.Temp - calibration.Temp > 2))
+        fileSystem.writeStruct("calibration", calibration);
+}
+
+void Heater::preReboot()
+{
+    MeshDevice::preReboot();
+    saveCurrentTime();
+}
+
+void Heater::saveCurrentTime()
+{
+
+    timeval tv;
+    gettimeofday(&tv, NULL);
+    fileSystem.writeStruct("/time", tv);
+}
+
+void Heater::serverTimeRecieved(timeval tv)
+{
+    MeshDevice::serverTimeRecieved(tv);
+    saveCurrentTime();
+}
