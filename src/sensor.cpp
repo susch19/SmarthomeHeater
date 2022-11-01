@@ -7,11 +7,19 @@ OneWire TempSensor::oneWire(sensorPin);
 DS18B20 TempSensor::sensor(&oneWire);
 TempSensor::TempSensor()
     : task(TASK_SECOND, TASK_FOREVER, [this]() {
-        
         while (callbacks.size() > 0)
         {
             tempMeasuremntCallback_t call = callbacks.front();
+            if(this->waitedSeconds >= 10)
+            {
+                this->waitedSeconds = 0;
+                task.disable();
+                call(-127.0);
+                return;
+            }   
+            
             if (!sensor.isConversionComplete()){
+                waitedSeconds++;
                 return;
             }
             callbacks.pop();

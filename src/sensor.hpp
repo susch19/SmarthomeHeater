@@ -17,6 +17,7 @@ public:
 private:
     static OneWire oneWire;
     static DS18B20 sensor;
+    size_t waitedSeconds = 0;
     Task task;
     std::queue<TempSensor::tempMeasuremntCallback_t> callbacks;
 };

@@ -87,4 +87,5 @@ private:
     bool disableLED = true;
     bool disableHeating = false;
     bool shouldCalibrate = false;
+
 };
